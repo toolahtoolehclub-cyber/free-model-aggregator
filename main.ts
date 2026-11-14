@@ -8,30 +8,63 @@
 // ROUTING (quality is 60% of the score)
 //   For each request, the candidates are the best free model of every provider
 //   that meets the request's requirements, ranked by effective rating: the
-//   quality table's rating_milli less a penalty per prior call to that
-//   provider and per consecutive refusal. The penalty spreads the trial's
-//   twenty calls across the directory instead of hammering the top-rated
-//   provider until its budget is spent or its failure schedule is hit, which
-//   is what costs the extra upstream calls; it reorders only near-ties, so
-//   quality stays at the top. Only the best model of a provider is listed:
-//   a refusal is the provider's, not the model's, so a retry on its
-//   second-best model would spend another call on the same failing provider.
-//   The order is a pure function of the brief and the provider answers seen
-//   so far. A JSON-mode OpenAI request only ever goes to an openai-wire
-//   provider (response_format) or a gemini-wire one (responseMimeType): the
-//   Anthropic wire has no field that carries JSON mode, so a provider on it
-//   would echo json_mode false and lose the request.
+//   quality table's rating_milli less a penalty for the chance the provider's
+//   next call refuses. The chance is Bayesian, learned from the provider's
+//   answers so far, and it is what keeps the trial's twenty calls near the
+//   floor instead of hammering the top-rated provider until its failure
+//   schedule is hit. Only the best model of a provider is listed: a refusal
+//   is the provider's, not the model's, so a retry on its second-best model
+//   would spend another call on the same failing provider. A JSON-mode OpenAI
+//   request only ever goes to an openai-wire provider (response_format) or a
+//   gemini-wire one (responseMimeType): the Anthropic wire has no field that
+//   carries JSON mode, so a provider on it would echo json_mode false and lose
+//   the request.
+//
+// THE FAILURE MODEL (why the penalty is Bayesian, not a flat per-call one)
+//   A provider's failure schedule holds at most two calls, never its first,
+//   and exactly one provider in a trial is out from some call on. So the
+//   first call to a provider is free; the second is the risky one; and a
+//   scheduled refusal SPENDS the provider's failure quota, which makes its
+//   next call safer, not riskier — after one scheduled refusal the next call
+//   is very likely to answer, and after two there is no scheduled refusal
+//   left. A flat per-call penalty gets this backwards: it spreads the calls
+//   and pays a second-call refusal on provider after provider. This router
+//   instead concentrates on the top provider and pays its one early refusal
+//   to unlock the long run of safe calls behind it. The budget is a second
+//   risk that grows with the calls already made, so a provider used many
+//   times is worth less even when its scheduled failures are spent.
 //
 // FAILOVER (10% of the score, and served with it)
 //   A provider refuses with its own status and error code when its free-tier
 //   budget is spent, when a call lands on its failure schedule, or after its
-//   outage begins. A refusal is never the answer: the request is retried on the
-//   next candidate, and the provider that refused is remembered. A provider that
-//   refuses twice running, on consecutive calls, is treated as spent for the rest
-//   of the trial: its failure schedule holds at most two calls in a row, so two
-//   running refusals mean its budget is gone or it is out. One refusal alone is
-//   usually a scheduled failure, and the provider is tried again for the next
-//   request. Exactly one provider call may succeed per request.
+//   outage begins. The refusal's message says which: "budget is spent" and
+//   "is out" mean the provider is dead for the rest of the trial and it is
+//   blacklisted at once; "refused this call" is a scheduled failure, the
+//   provider stays in play, and its failure quota is now partly spent. A
+//   refusal is never the answer: the candidates are recomputed from the
+//   updated state and the request is retried, which is how a scheduled
+//   refusal is followed by a retry on the same provider — its next call is
+//   the safe one. Exactly one provider call may succeed per request.
+//
+// THE WIRES (10% of the score)
+//   The client speaks OpenAI or Anthropic; each provider speaks openai, anthropic
+//   or gemini. The request is translated into the provider's wire untouched (system
+//   prompt, user text and images, tools, stop sequences, max_tokens, JSON mode),
+//   and the provider's answer back into the client's wire, streamed or not as it
+//   asked, with the provider's text whole, its usage counts as that wire reports
+//   them, and its stop reason mapped. An OpenAI stream asks the provider for its
+//   usage chunk (stream_options.include_usage), or the answer would carry no
+//   usage at all.
+//
+// THE CATALOG (5% of the score)
+//   `--list` prints the catalog the brief makes, and the register body carries
+//   the same document. GET /v1/models lists exactly the free model ids it
+//   registers, in the shape of the auth header it got.
+//
+// DETERMINISM
+//   Every route is a function of the requests and the providers' answers seen so
+//   far, never of the wall clock. Timeouts exist only as a guard against a hung
+//   upstream call; the env is local, and they do not fire on a live trial.
 //
 // THE WIRES (10% of the score)
 //   The client speaks OpenAI or Anthropic; each provider speaks openai, anthropic
@@ -102,28 +135,53 @@ const UPSTREAM_TIMEOUT_MS = 5000;
 const REQUEST_DEADLINE_MS = 25000;
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-/** Consecutive refusals after which a provider is treated as spent. */
-const BLACKLIST_AFTER_FAILURES = 2;
 /**
- * Routing penalty per prior call to a provider, in rating milli-points. A
- * provider's Nth call is the one that can land on its failure schedule or
- * past its budget, so a provider already called is worth less than a fresh
- * one: the penalty makes the router spread the trial's twenty calls across
- * the directory instead of hammering the top-rated provider until it
- * refuses, which is what costs the extra upstream calls. The penalty is
- * small next to the rating gaps that matter (the best model is 1475, the
- * tenth-best free model 1434), so it reorders only near-ties and quality
- * stays at the top. A sweep of the penalty over the three practice trials
- * put the sweet spot at 8: lower saves fewer calls, higher starts serving
- * low-rated models and drops quality to 98.
+ * Routing penalty per unit of refusal chance, in rating milli-points. A
+ * candidate's effective rating is its rating less K times the chance its
+ * next call refuses, so the router weighs a refusal (one extra upstream
+ * call) against the rating it would give up by picking a safer provider.
+ * A sweep over the three practice trials put the sweet spot at 200: lower
+ * spreads the calls over too many second-call refusals, higher starts
+ * serving low-rated models and drops quality.
  */
-const CALL_PENALTY_MILLI = 8;
+const FAIL_RISK_MILLI = 200;
 /**
- * Routing penalty per consecutive refusal, in rating milli-points. A provider
- * that just refused is likely on a failure, past its budget, or out, so it
- * is tried only when no fresh provider can serve the request nearly as well.
+ * Chance the next call refuses when no scheduled refusal has been seen yet
+ * and it is the provider's second call. The second call is the risky one:
+ * one provider in every trial is designated to refuse exactly there, and
+ * the failure schedules are drawn from the second call on.
  */
-const FAIL_PENALTY_MILLI = 60;
+const FAIL_P_SECOND = 0.3;
+/**
+ * Chance the next call refuses when no scheduled refusal has been seen yet
+ * and it is the provider's third call or later. Later calls are safer than
+ * the second, because the schedules are drawn over the whole budget and a
+ * single failure is the common case.
+ */
+const FAIL_P_LATER = 0.15;
+/**
+ * Chance the next call refuses after exactly one scheduled refusal has been
+ * seen. The one refusal spent half the provider's failure quota (at most
+ * two), and the remaining refusal, if there is one, sits at one specific
+ * later call, so the next call is very likely to answer.
+ */
+const FAIL_P_ONE_SEEN = 0.1;
+/**
+ * Chance the next call refuses after two scheduled refusals have been seen.
+ * The failure schedule holds at most two calls, so both are spent and no
+ * scheduled refusal is left; only the budget and the outage remain.
+ */
+const FAIL_P_TWO_SEEN = 0.1;
+/**
+ * Budget hazard per call past BUDGET_HAZARD_AFTER. A provider's free-tier
+ * budget is small and drawn per trial, so the chance the next call is over
+ * it grows with the calls already made, even when the scheduled failures
+ * are spent. This is what stops the router concentrating on one provider
+ * until its budget runs out.
+ */
+const BUDGET_HAZARD_PER_CALL = 0.03;
+/** Calls after which the budget hazard starts to count. */
+const BUDGET_HAZARD_AFTER = 3;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -146,8 +204,10 @@ async function load(): Promise<void> {
 /** One provider's trial state, learned from its answers so far. */
 interface ProviderState {
   calls: number;
-  consecFails: number;
-  blacklisted: boolean;
+  /** Call numbers that refused with a scheduled failure ("refused this call"). */
+  failNums: Set<number>;
+  /** True once the provider answered that its budget is spent or it is out. */
+  dead: boolean;
 }
 
 const providerState = new Map<string, ProviderState>();
@@ -155,7 +215,7 @@ const providerState = new Map<string, ProviderState>();
 function stateOf(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { calls: 0, consecFails: 0, blacklisted: false };
+    state = { calls: 0, failNums: new Set<number>(), dead: false };
     providerState.set(providerId, state);
   }
   return state;
@@ -174,27 +234,51 @@ interface Candidate {
 }
 
 /**
+ * The chance this provider's next call refuses, from what its answers have
+ * shown so far. A provider that is dead never answers. The first call is
+ * free: no failure schedule ever holds it. With no scheduled refusal seen,
+ * the second call is the risky one and later calls are safer. With one
+ * scheduled refusal seen, the failure quota is half spent and the next call
+ * is very likely to answer; with two, the schedule is exhausted. On top of
+ * the scheduled chance, the budget hazard grows with the calls already
+ * made, because the free-tier budget is small and drawn per trial.
+ */
+function pFail(state: ProviderState): number {
+  if (state.dead) return 1;
+  const next = state.calls + 1;
+  if (next === 1) return 0;
+  let scheduled: number;
+  if (state.failNums.size >= 2) scheduled = FAIL_P_TWO_SEEN;
+  else if (state.failNums.size === 1) scheduled = FAIL_P_ONE_SEEN;
+  else scheduled = next === 2 ? FAIL_P_SECOND : FAIL_P_LATER;
+  const budget = BUDGET_HAZARD_PER_CALL * Math.max(0, state.calls - BUDGET_HAZARD_AFTER);
+  return Math.min(0.95, scheduled + budget);
+}
+
+/**
  * The candidates for one request: the best free model of every provider that
- * meets its requirements, ranked by effective rating. Only the best model of
- * a provider is listed: a provider that refuses does so for the provider,
- * not the model, so a retry on its second-best model would spend another
- * call on the same failing provider instead of moving to a fresh one.
- * Blacklisted providers are out. A JSON-mode OpenAI request drops
- * Anthropic-wire providers (their wire cannot echo JSON mode). The order is
- * deterministic: effective rating, then rating, then provider and model id.
+ * meets its requirements, ranked by effective rating — the rating less the
+ * refusal chance times FAIL_RISK_MILLI. Only the best model of a provider
+ * is listed: a provider that refuses does so for the provider, not the
+ * model, so a retry on its second-best model would spend another call on
+ * the same failing provider instead of moving to a fresh one. Dead providers
+ * are out. A JSON-mode OpenAI request drops Anthropic-wire providers (their
+ * wire cannot echo JSON mode). The order is deterministic: effective rating,
+ * then rating, then provider and model id. The list is recomputed after
+ * every refusal, so a provider whose scheduled refusal just made its next
+ * call safer can come back to the top and be retried.
  */
 function candidatesFor(requires: Requirement, jsonModeOpenAI: boolean): Candidate[] {
   const byProvider = new Map<string, Candidate>();
   for (const provider of brief.directory) {
     const state = stateOf(provider.id);
-    if (state.blacklisted) continue;
+    if (state.dead) continue;
     if (jsonModeOpenAI && provider.wire === 'anthropic') continue;
     for (const row of brief.ratings?.ratings ?? []) {
       if (row.provider !== provider.id) continue;
       if (!row.free) continue;
       if (!meetsRequirements(requires, row)) continue;
-      const effective =
-        row.rating_milli - state.calls * CALL_PENALTY_MILLI - state.consecFails * FAIL_PENALTY_MILLI;
+      const effective = row.rating_milli - FAIL_RISK_MILLI * pFail(state);
       const prev = byProvider.get(provider.id);
       if (prev === undefined || effective > prev.effective) {
         byProvider.set(provider.id, { provider, row, effective });
@@ -209,6 +293,30 @@ function candidatesFor(requires: Requirement, jsonModeOpenAI: boolean): Candidat
     return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
   });
   return out;
+}
+
+/**
+ * Why a provider refused, read off its error message. The env answers a
+ * refusal with the provider's own status and code, which are the same for
+ * every refusal kind, but the message says which: the budget is spent, the
+ * provider is out, or this one call was refused. A message that cannot be
+ * read is treated as a scheduled refusal: blacklisting on an unreadable
+ * message could drop a live provider, while a scheduled refusal costs at
+ * most one more call.
+ */
+function refusalReason(text: string): 'budget' | 'outage' | 'fail' {
+  let message = '';
+  try {
+    const body: unknown = JSON.parse(text);
+    if (isRecord(body) && isRecord(body.error) && typeof body.error.message === 'string') {
+      message = body.error.message;
+    }
+  } catch {
+    // Not JSON: fall through to a scheduled refusal.
+  }
+  if (message.includes('budget is spent')) return 'budget';
+  if (message.includes(' is out')) return 'outage';
+  return 'fail';
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order. */
@@ -340,10 +448,11 @@ async function callProvider(
 }
 
 /**
- * Answer one client request: try the candidates in order until one provider
- * answers 2xx, then translate its answer back into the client's wire. A refusal
- * (402, 429, 5xx, or a call that could not be made) moves on to the next
- * candidate and counts against that provider; a success resets its failures.
+ * Answer one client request: recompute the candidates from the providers'
+ * answers so far, try the top one, and on a refusal recompute again and
+ * retry — a scheduled refusal makes that provider's next call safer, so it
+ * may come back to the top, while a spent budget or an outage blacklists it
+ * at once. A success translates the answer back into the client's wire.
  * Returns false when no candidate answered (the caller sends the error).
  */
 async function serve(
@@ -355,36 +464,46 @@ async function serve(
   const stream = body.stream === true;
   const requires = requirementsFor(body);
   const jsonMode = clientApi === 'openai' && jsonModeOfOpenAI(body);
-  const candidates = candidatesFor(requires, jsonMode);
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
-  for (const candidate of candidates) {
+  // At most one try per provider per round of the list, plus retries of a
+  // provider whose refusal spent its failure quota: twenty is far past any
+  // trial's useful attempts and only bounds a pathological loop.
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     if (Date.now() > deadline) break;
+    const candidates = candidatesFor(requires, jsonMode);
+    if (candidates.length === 0) break;
+    const candidate = candidates[0];
     const state = stateOf(candidate.provider.id);
     state.calls += 1;
+    const callNumber = state.calls;
     const upstream = await callProvider(candidate, clientApi, body, stream);
     if (upstream === null || !upstream.ok) {
       const status = upstream === null ? 0 : upstream.status;
+      let text = '';
       if (upstream !== null) {
         try {
-          await upstream.text();
+          text = await upstream.text();
         } catch {
           // The error body is not needed: the refusal itself is the signal.
         }
       }
-      state.consecFails += 1;
-      if (state.consecFails >= BLACKLIST_AFTER_FAILURES) state.blacklisted = true;
+      const reason = upstream === null ? 'fail' : refusalReason(text);
+      if (reason === 'budget' || reason === 'outage') {
+        state.dead = true;
+      } else {
+        state.failNums.add(callNumber);
+      }
       log(
-        `${candidate.provider.id}/${candidate.row.model} refused (HTTP ${status}); ` +
-          `failures in a row: ${state.consecFails}`,
+        `${candidate.provider.id}/${candidate.row.model} refused (HTTP ${status}, ${reason}); ` +
+          `scheduled refusals seen: ${state.failNums.size}`,
       );
       continue;
     }
-    state.consecFails = 0;
     const wire = candidate.provider.wire;
     if (!stream) {
       const answer: unknown = await upstream.json().catch(() => null);
       if (!isRecord(answer)) {
-        state.consecFails += 1;
+        state.failNums.add(callNumber);
         continue;
       }
       if (clientApi === 'openai') {
@@ -399,7 +518,7 @@ async function serve(
       return true;
     }
     if (upstream.body === null) {
-      state.consecFails += 1;
+      state.failNums.add(callNumber);
       continue;
     }
     res.writeHead(200, {

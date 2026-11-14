@@ -6,15 +6,21 @@
 // env: there is no model of its own.
 //
 // ROUTING (quality is 60% of the score)
-//   For each request, the candidates are every free model that meets the request's
-//   requirements, ranked by the quality table's rating_milli, best first. Ties
-//   break toward the provider that has failed least recently, then the one that has
-//   been called least, then by provider and model id, so the order is a pure
-//   function of the brief and the provider answers seen so far. A JSON-mode OpenAI
-//   request only ever goes to an openai-wire provider (response_format) or a
-//   gemini-wire one (responseMimeType): the Anthropic wire has no field that
-//   carries JSON mode, so a provider on it would echo json_mode false and lose
-//   the request.
+//   For each request, the candidates are the best free model of every provider
+//   that meets the request's requirements, ranked by effective rating: the
+//   quality table's rating_milli less a penalty per prior call to that
+//   provider and per consecutive refusal. The penalty spreads the trial's
+//   twenty calls across the directory instead of hammering the top-rated
+//   provider until its budget is spent or its failure schedule is hit, which
+//   is what costs the extra upstream calls; it reorders only near-ties, so
+//   quality stays at the top. Only the best model of a provider is listed:
+//   a refusal is the provider's, not the model's, so a retry on its
+//   second-best model would spend another call on the same failing provider.
+//   The order is a pure function of the brief and the provider answers seen
+//   so far. A JSON-mode OpenAI request only ever goes to an openai-wire
+//   provider (response_format) or a gemini-wire one (responseMimeType): the
+//   Anthropic wire has no field that carries JSON mode, so a provider on it
+//   would echo json_mode false and lose the request.
 //
 // FAILOVER (10% of the score, and served with it)
 //   A provider refuses with its own status and error code when its free-tier
@@ -98,6 +104,26 @@ const REQUEST_DEADLINE_MS = 25000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** Consecutive refusals after which a provider is treated as spent. */
 const BLACKLIST_AFTER_FAILURES = 2;
+/**
+ * Routing penalty per prior call to a provider, in rating milli-points. A
+ * provider's Nth call is the one that can land on its failure schedule or
+ * past its budget, so a provider already called is worth less than a fresh
+ * one: the penalty makes the router spread the trial's twenty calls across
+ * the directory instead of hammering the top-rated provider until it
+ * refuses, which is what costs the extra upstream calls. The penalty is
+ * small next to the rating gaps that matter (the best model is 1475, the
+ * tenth-best free model 1434), so it reorders only near-ties and quality
+ * stays at the top. A sweep of the penalty over the three practice trials
+ * put the sweet spot at 8: lower saves fewer calls, higher starts serving
+ * low-rated models and drops quality to 98.
+ */
+const CALL_PENALTY_MILLI = 8;
+/**
+ * Routing penalty per consecutive refusal, in rating milli-points. A provider
+ * that just refused is likely on a failure, past its budget, or out, so it
+ * is tried only when no fresh provider can serve the request nearly as well.
+ */
+const FAIL_PENALTY_MILLI = 60;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -143,17 +169,22 @@ function log(message: string): void {
 interface Candidate {
   provider: ProviderEntry;
   row: RatingRow;
+  /** Rating less the routing penalties: the order the router tries them in. */
+  effective: number;
 }
 
 /**
- * The candidates for one request: every free model meeting its requirements,
- * ranked best first. A JSON-mode OpenAI request drops Anthropic-wire providers
- * (their wire cannot echo JSON mode). Blacklisted providers are out. The order
- * is deterministic: rating, then fewest running failures, then fewest calls,
- * then provider and model id.
+ * The candidates for one request: the best free model of every provider that
+ * meets its requirements, ranked by effective rating. Only the best model of
+ * a provider is listed: a provider that refuses does so for the provider,
+ * not the model, so a retry on its second-best model would spend another
+ * call on the same failing provider instead of moving to a fresh one.
+ * Blacklisted providers are out. A JSON-mode OpenAI request drops
+ * Anthropic-wire providers (their wire cannot echo JSON mode). The order is
+ * deterministic: effective rating, then rating, then provider and model id.
  */
 function candidatesFor(requires: Requirement, jsonModeOpenAI: boolean): Candidate[] {
-  const out: Candidate[] = [];
+  const byProvider = new Map<string, Candidate>();
   for (const provider of brief.directory) {
     const state = stateOf(provider.id);
     if (state.blacklisted) continue;
@@ -162,15 +193,18 @@ function candidatesFor(requires: Requirement, jsonModeOpenAI: boolean): Candidat
       if (row.provider !== provider.id) continue;
       if (!row.free) continue;
       if (!meetsRequirements(requires, row)) continue;
-      out.push({ provider, row });
+      const effective =
+        row.rating_milli - state.calls * CALL_PENALTY_MILLI - state.consecFails * FAIL_PENALTY_MILLI;
+      const prev = byProvider.get(provider.id);
+      if (prev === undefined || effective > prev.effective) {
+        byProvider.set(provider.id, { provider, row, effective });
+      }
     }
   }
+  const out = [...byProvider.values()];
   out.sort((a, b) => {
+    if (a.effective !== b.effective) return b.effective - a.effective;
     if (a.row.rating_milli !== b.row.rating_milli) return b.row.rating_milli - a.row.rating_milli;
-    const sa = stateOf(a.provider.id);
-    const sb = stateOf(b.provider.id);
-    if (sa.consecFails !== sb.consecFails) return sa.consecFails - sb.consecFails;
-    if (sa.calls !== sb.calls) return sa.calls - sb.calls;
     if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
     return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
   });

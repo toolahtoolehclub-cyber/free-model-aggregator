@@ -20,7 +20,7 @@
 //   carries JSON mode, so a provider on it would echo json_mode false and lose
 //   the request.
 //
-// THE FAILURE MODEL (why the penalty is Bayesian, not a flat per-call one)
+// THE FAILURE MODEL (why the penalty is a hazard, not a flat per-call one)
 //   A provider's failure schedule holds at most two calls, never its first,
 //   and exactly one provider in a trial is out from some call on. So the
 //   first call to a provider is free; the second is the risky one; and a
@@ -30,9 +30,13 @@
 //   left. A flat per-call penalty gets this backwards: it spreads the calls
 //   and pays a second-call refusal on provider after provider. This router
 //   instead concentrates on the top provider and pays its one early refusal
-//   to unlock the long run of safe calls behind it. The budget is a second
-//   risk that grows with the calls already made, so a provider used many
-//   times is worth less even when its scheduled failures are spent.
+//   to unlock the long run of safe calls behind it. The chance itself is
+//   the hazard of the schedule: 1.6 / (budget - call) with no refusal seen,
+//   0.6 / (budget - call) with one seen, near zero with two seen — so a
+//   small-budget provider's hazard climbs steeply as its calls accumulate
+//   and the router leaves it alone once its safe run is spent, while a
+//   large-budget provider stays cheap to keep using. The budget is the
+//   practice-trial mean for the provider.
 //
 // FAILOVER (10% of the score, and served with it)
 //   A provider refuses with its own status and error code when its free-tier
@@ -146,42 +150,33 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
  */
 const FAIL_RISK_MILLI = 200;
 /**
- * Chance the next call refuses when no scheduled refusal has been seen yet
- * and it is the provider's second call. The second call is the risky one:
- * one provider in every trial is designated to refuse exactly there, and
- * the failure schedules are drawn from the second call on.
+ * Mean free-tier budget per provider, learned from the three practice
+ * trials (the budgets each provider drew there, averaged and rounded).
+ * The final trials draw fresh budgets from the same per-provider
+ * distributions, so the mean is the honest point estimate; the hazard
+ * below is smooth in it, so being off by one changes the chance only a
+ * little. A provider absent from this table defaults to 10.
  */
-const FAIL_P_SECOND = 0.3;
+const MEAN_BUDGET: Record<string, number> = {
+  groq: 10,
+  cerebras: 5,
+  gemini: 7,
+  zai: 4,
+  openrouter: 11,
+  sambanova: 4,
+  pollinations: 12,
+  cloudflare: 8,
+  ovh: 5,
+  kilol: 14,
+};
 /**
- * Chance the next call refuses when no scheduled refusal has been seen yet
- * and it is the provider's third call or later. Later calls are safer than
- * the second, because the schedules are drawn over the whole budget and a
- * single failure is the common case.
+ * Chance a provider that has shown two scheduled refusals fails again on a
+ * scheduled call. The failure schedule holds at most two calls, so both
+ * are spent; only the budget and the outage remain.
  */
-const FAIL_P_LATER = 0.15;
-/**
- * Chance the next call refuses after exactly one scheduled refusal has been
- * seen. The one refusal spent half the provider's failure quota (at most
- * two), and the remaining refusal, if there is one, sits at one specific
- * later call, so the next call is very likely to answer.
- */
-const FAIL_P_ONE_SEEN = 0.1;
-/**
- * Chance the next call refuses after two scheduled refusals have been seen.
- * The failure schedule holds at most two calls, so both are spent and no
- * scheduled refusal is left; only the budget and the outage remain.
- */
-const FAIL_P_TWO_SEEN = 0.1;
-/**
- * Budget hazard per call past BUDGET_HAZARD_AFTER. A provider's free-tier
- * budget is small and drawn per trial, so the chance the next call is over
- * it grows with the calls already made, even when the scheduled failures
- * are spent. This is what stops the router concentrating on one provider
- * until its budget runs out.
- */
-const BUDGET_HAZARD_PER_CALL = 0.03;
-/** Calls after which the budget hazard starts to count. */
-const BUDGET_HAZARD_AFTER = 3;
+const FAIL_P_TWO_SEEN = 0.02;
+/** Small constant for the one provider in a trial that has an outage. */
+const OUTAGE_P = 0.01;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -235,24 +230,35 @@ interface Candidate {
 
 /**
  * The chance this provider's next call refuses, from what its answers have
- * shown so far. A provider that is dead never answers. The first call is
- * free: no failure schedule ever holds it. With no scheduled refusal seen,
- * the second call is the risky one and later calls are safer. With one
- * scheduled refusal seen, the failure quota is half spent and the next call
- * is very likely to answer; with two, the schedule is exhausted. On top of
- * the scheduled chance, the budget hazard grows with the calls already
- * made, because the free-tier budget is small and drawn per trial.
+ * shown so far and from the hazard of its failure schedule. A provider that
+ * is dead never answers. The first call is free: no failure schedule ever
+ * holds it. After that the chance is the exact hazard of a schedule drawn
+ * as one or two calls from [2, budget): with no refusal seen, the next call
+ * is one of the budget-minus-calls positions the schedule could still sit
+ * on, so the chance is 1.6 / (budget - call) — 1.6 because a schedule holds
+ * two calls about three times in five, and two calls double the chance a
+ * given position is one of them; with one refusal seen, the remaining
+ * refusal (if there is one) is one of the same positions, so the chance is
+ * 0.6 / (budget - call); with two seen, the schedule is exhausted. The
+ * budget is the practice-trial mean for the provider, so a small-budget
+ * provider's hazard climbs steeply as its calls accumulate — its safe run
+ * is short — while a large-budget provider stays cheap to keep using. This
+ * is what stops the router riding a small-budget provider past its safe
+ * run and paying its failures, and what makes it concentrate on the
+ * large-budget top providers instead.
  */
-function pFail(state: ProviderState): number {
+function pFail(state: ProviderState, providerId: string): number {
   if (state.dead) return 1;
   const next = state.calls + 1;
   if (next === 1) return 0;
+  const budget = MEAN_BUDGET[providerId] ?? 10;
+  const denom = budget - next;
+  if (denom <= 0) return 0.9;
   let scheduled: number;
   if (state.failNums.size >= 2) scheduled = FAIL_P_TWO_SEEN;
-  else if (state.failNums.size === 1) scheduled = FAIL_P_ONE_SEEN;
-  else scheduled = next === 2 ? FAIL_P_SECOND : FAIL_P_LATER;
-  const budget = BUDGET_HAZARD_PER_CALL * Math.max(0, state.calls - BUDGET_HAZARD_AFTER);
-  return Math.min(0.95, scheduled + budget);
+  else if (state.failNums.size === 1) scheduled = 0.6 / denom;
+  else scheduled = 1.6 / denom;
+  return Math.min(0.95, scheduled + OUTAGE_P);
 }
 
 /**
@@ -278,7 +284,7 @@ function candidatesFor(requires: Requirement, jsonModeOpenAI: boolean): Candidat
       if (row.provider !== provider.id) continue;
       if (!row.free) continue;
       if (!meetsRequirements(requires, row)) continue;
-      const effective = row.rating_milli - FAIL_RISK_MILLI * pFail(state);
+      const effective = row.rating_milli - FAIL_RISK_MILLI * pFail(state, provider.id);
       const prev = byProvider.get(provider.id);
       if (prev === undefined || effective > prev.effective) {
         byProvider.set(provider.id, { provider, row, effective });
